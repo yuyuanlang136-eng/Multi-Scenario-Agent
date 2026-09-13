@@ -139,6 +139,7 @@ class Agent:
                  api_base: str | None=None,
                  anthropic_base_url: str | None=None,
                  api_key: str | None=None,
+                 use_openai: bool | None=None,
                  thinking: bool=False,
                  max_cost_usd: float | None=None,
                  max_turns: int | None=None,
@@ -149,7 +150,9 @@ class Agent:
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
-        self.use_openai = bool(api_base)
+        # 协议与自定义 URL 是两个独立配置：OpenAI 可以不传 base_url，
+        # 此时 SDK 会使用官方默认地址。未显式指定协议时保留旧的推断方式。
+        self.use_openai = bool(api_base) if use_openai is None else use_openai
         self.is_sub_agent = is_sub_agent
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd

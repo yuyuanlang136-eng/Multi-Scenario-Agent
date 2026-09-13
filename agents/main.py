@@ -400,6 +400,7 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
+        use_openai=resolved_use_openai,
     )
 
     # Resume session
