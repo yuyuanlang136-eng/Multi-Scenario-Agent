@@ -91,8 +91,9 @@ def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
     if not base_url:
         return False
     parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
     path = (parsed.path or "").lower().rstrip("/")
-    return path.endswith("/anthropic") or "/anthropic/" in path
+    return hostname == "api.anthropic.com" or path.endswith("/anthropic") or "/anthropic/" in path
 
 
 def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | None, bool]:
@@ -100,22 +101,36 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
     openai_api_key = _clean_env(os.environ.get("OPENAI_API_KEY"))
     anthropic_api_key = _clean_env(os.environ.get("ANTHROPIC_API_KEY"))
 
+    cli_api_base = _clean_env(cli_api_base)
     generic_api_base = _clean_env(os.environ.get("API")) or _clean_env(os.environ.get("MINI_CLAUDE_API_BASE"))
     openai_api_base = _clean_env(os.environ.get("OPENAI_BASE_URL"))
     anthropic_api_base = _clean_env(os.environ.get("ANTHROPIC_BASE_URL"))
 
-    resolved_api_base = _clean_env(cli_api_base) or generic_api_base or openai_api_base or anthropic_api_base
+    # 命令行和通用 URL 没有明确协议，只能根据 URL 约定推断。
+    if cli_api_base:
+        use_openai = not _is_anthropic_compatible_base_url(cli_api_base)
+        matching_api_key = openai_api_key if use_openai else anthropic_api_key
+        api_key = matching_api_key or generic_api_key
+        return cli_api_base, api_key, use_openai
 
-    if resolved_api_base:
-        if _is_anthropic_compatible_base_url(resolved_api_base):
-            return resolved_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
-        return resolved_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
+    if generic_api_base:
+        use_openai = not _is_anthropic_compatible_base_url(generic_api_base)
+        matching_api_key = openai_api_key if use_openai else anthropic_api_key
+        return generic_api_base, generic_api_key or matching_api_key, use_openai
 
-    if anthropic_api_key or anthropic_api_base:
-        return anthropic_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
+    # 专用 URL 的变量名已经明确协议，不再根据 URL 文本猜测。
+    if openai_api_base:
+        return openai_api_base, openai_api_key or generic_api_key, True
 
-    if openai_api_key or openai_api_base:
-        return openai_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
+    if anthropic_api_base:
+        return anthropic_api_base, anthropic_api_key or generic_api_key, False
+
+    # 没有自定义 URL 时，SDK 会使用对应协议的官方默认地址。
+    if anthropic_api_key:
+        return None, anthropic_api_key, False
+
+    if openai_api_key:
+        return None, openai_api_key, True
 
     if generic_api_key:
         return None, generic_api_key, False
