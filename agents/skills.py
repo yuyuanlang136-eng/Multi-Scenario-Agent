@@ -258,6 +258,12 @@ def retrieve_relevant_skills(
     limit: int = 3,
     min_score: float = 0.08,
 ) -> list[dict[str, Any]]:
+    """用本地词法相关度检索 Skill，返回最多 limit 个候选的元数据。
+
+    评分会读取 Skill 正文以提高召回率，但返回值不含正文。该函数不调用 LLM，
+    也不会自动激活 Skill；模型仍需调用 skill 工具才能取得完整执行指令。
+    """
+    # 将当前 query 切成英文单词和中文双字片段，去掉常见停用词。
     query_terms = _token_list(query)
     query_tokens = set(query_terms)
     if not query_tokens:
@@ -266,6 +272,7 @@ def retrieve_relevant_skills(
     docs: list[tuple[SkillDefinition, list[str]]] = []
     document_frequency: Counter[str] = Counter()
     for skill in discover_skills():
+        # 元数据重复 3 次以提高权重；正文只取前 2500 字符参与匹配。
         meta_terms = _token_list("\n".join([skill.name, skill.description, skill.when_to_use or ""]))
         body_terms = _token_list(skill.prompt_template[:2500])
         terms = (meta_terms * 3) + body_terms
@@ -281,6 +288,7 @@ def retrieve_relevant_skills(
     k1 = 1.4
     b = 0.75
     hits: list[dict[str, Any]] = []
+    # 使用 BM25 风格的词频、逆文档频率和文档长度归一化计算相关度。
     for skill, terms in docs:
         term_counts = Counter(terms)
         overlap = query_tokens & set(term_counts)
@@ -297,6 +305,7 @@ def retrieve_relevant_skills(
         score = min(1.0, (raw_score / max(3.0, len(query_tokens))) + name_bonus)
         if score < float(min_score):
             continue
+        # 这里只返回索引信息。prompt_template 正文会在 execute_skill() 时按需读取。
         hits.append(
             {
                 "score": float(score),
@@ -315,6 +324,7 @@ def retrieve_relevant_skills(
 
 
 def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, dict[str, Any] | None]:
+    """把 Top-K Skill 元数据格式化为当前用户消息后的 <retrieved_skills> 提示块。"""
     hits = retrieve_relevant_skills(query, limit=limit)
     if not hits:
         return "", None

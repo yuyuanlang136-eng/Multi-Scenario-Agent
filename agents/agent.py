@@ -397,10 +397,13 @@ class Agent:
     def get_token_usage(self) -> dict:
         return {"input":self.total_input_tokens, "output":self.total_output_tokens}
 
-    #主入口
+    # 主入口：处理一轮用户对话。REPL 会为每次输入调用一次 chat()；
+    # one-shot 也调用同一个函数，只是执行一轮后就退出。
+    async def chat(self, user_message: str) -> None:
+        """完成一轮主对话，并在回答结束后安排 Skill 统计与进化任务。"""
 
-    async def  chat(self, user_message:str)->None:
-        #懒加载MCP服务在第一次chat的时候
+        # 1. MCP 采用懒加载：仅主 Agent 的第一次 chat() 连接 MCP Server，
+        #    然后把 Server 动态公布的工具追加到内置工具列表。
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
@@ -411,38 +414,62 @@ class Agent:
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
+        # 2. 保留用户真正输入的原文。下面的 user_message 可能被追加 Skill 召回信息，
+        #    original_user_message 则供反馈分析、Skill 统计和学习使用。
         original_user_message = _safe_utf8_text(user_message)
+
+        # 这是“上一轮对话 + 本轮用户反馈”的 Skill 学习窗口，不是发给主 LLM 的消息。
+        # 第一轮没有上一轮窗口，因此为 None；通常从第二轮开始才可能有值。
         ready_skill_extraction_window: dict[str, Any] | None = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
         if not self.is_sub_agent:
+            # 取出上一轮结束时暂存的窗口，并把本轮原始输入作为对上一轮的后续反馈。
             ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
+
+            # 根据本轮 query 在本地检索最多 3 个相关 Skill。检索会参考 Skill 正文，
+            # 但这里只把名称、描述和 when_to_use 摘要追加给主 LLM，不注入完整正文。
             user_message, self._last_retrieved_skill_reference = self._augment_user_message_with_skill_context(
                 original_user_message
             )
 
+        # 3. 根据 API 协议选择真正的 Agent Loop。调用 async 函数先得到 coroutine，
+        #    create_task() 再把它交给事件循环；保存 Task 是为了支持 abort() 取消本轮。
         self._aborted = False
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
         try:
+            # 等待完整 Agent Loop：可能包含多次“LLM -> 工具 -> LLM”循环。
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
-
         finally:
+            # 无论正常完成还是取消，都清除“当前正在运行的任务”引用。
             self._current_task = None
+
+        # 4. 流式输出由 _emit_text() 分片写入此列表；这里拼成本轮完整回答，
+        #    供后续 Skill 使用效果判断和 Skill 候选提取使用。
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
+
         if not self.is_sub_agent and not self._aborted:
+            # 任务 A：只评估“本轮召回的 Skill 是否相关、是否真的被回答采用”。
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
+
+            # 任务 B：如果本轮开始时取到了上一轮窗口，则在后台判断其中是否有
+            # 可长期复用的经验，并选择 add / merge / discard。第一轮这里不会执行。
             if ready_skill_extraction_window:
                 self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
+
+            # 暂存“本轮用户输入 + 本轮回答”。要等下一轮用户输入作为反馈到来后，
+            # 才由上面的 _pop_pending_skill_extraction_window() 取出并进入进化流程。
             self._set_pending_skill_extraction_window(
                 original_user_message=original_user_message,
                 assistant_text=assistant_text,
                 retrieved_reference=self._last_retrieved_skill_reference,
             )
+        # 5. 主 Agent 打印回合结束线，并把当前消息历史保存为 session JSON。
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
@@ -530,6 +557,11 @@ class Agent:
         return False
 
     def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
+        """为本轮 query 召回 Skill 摘要，并返回“增强后的消息、最高分引用”。
+
+        召回本身是本地关键词/BM25 风格评分，不调用 LLM。完整 SKILL.md 正文只有在
+        模型随后调用 skill 工具时才会加载；这里注入的只是候选 Skill 的索引信息。
+        """
         try:
             from .skills import format_retrieved_skill_context
 
@@ -543,6 +575,7 @@ class Agent:
         return f"{user_message}\n\n{context}", top_ref
 
     def _strip_runtime_injections(self, text: str) -> str:
+        """移除运行时追加的 Skill 召回块，避免把系统注入误当成用户原始证据。"""
         return re.sub(r"\n*<retrieved_skills>.*?</retrieved_skills>\s*", "", str(text or ""), flags=re.DOTALL).strip()
 
     def _message_text(self, msg: dict[str, Any]) -> str:
@@ -561,6 +594,7 @@ class Agent:
         return ""
 
     def _recent_dialog_messages(self, *, max_messages: int = 8) -> list[dict[str, str]]:
+        """提取最近的纯用户/助手文本，供 Skill 学习使用，不包含工具块和召回注入。"""
         raw_messages = self._openai_messages if self.use_openai else self._anthropic_messages
         out: list[dict[str, str]] = []
         for msg in raw_messages:
@@ -595,6 +629,7 @@ class Agent:
         return raw not in {"0", "false", "no", "off"}
 
     def _schedule_background_skill_task(self, coro) -> None:
+        """调度 Skill 后台任务并持有引用，防止异常影响主对话或任务被提前回收。"""
         if self.permission_mode == "plan":
             try:
                 coro.close()
@@ -614,12 +649,18 @@ class Agent:
         task.add_done_callback(_done)
 
     async def drain_background_skill_tasks(self) -> None:
+        """等待尚未完成的 Skill 后台任务；one-shot/REPL 退出前会调用。"""
         tasks = [task for task in self._background_skill_tasks if not task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _pop_pending_skill_extraction_window(self, next_user_feedback: str) -> dict[str, Any] | None:
+        """消费上一轮待学习窗口，并附加本轮输入作为对上一轮回答的反馈。
+
+        这里的 messages 只交给在线 Skill 提取器，不会作为当前主对话消息发给 LLM。
+        """
         pending = self._pending_skill_extraction_window
+        # pop 语义：取出后立刻清空槽位，确保同一窗口不会被重复学习。
         self._pending_skill_extraction_window = None
         if not pending:
             return None
@@ -627,6 +668,7 @@ class Agent:
         feedback = _safe_utf8_text(next_user_feedback).strip()
         if feedback:
             messages.append({"role": "user", "content": feedback})
+        # 限制窗口大小，避免后台 Skill 提取请求随着对话无限增长。
         pending["messages"] = messages[-10:]
         pending["next_user_feedback"] = feedback
         return pending
@@ -638,6 +680,7 @@ class Agent:
         assistant_text: str,
         retrieved_reference: dict[str, Any] | None,
     ) -> None:
+        """在本轮结束时暂存对话；下一轮输入到来后才把它变成可学习窗口。"""
         if not original_user_message.strip() or not assistant_text.strip():
             return
         self._pending_skill_extraction_window = {
@@ -649,17 +692,24 @@ class Agent:
         }
 
     def _compact_retrieved_reference(self, ref: dict[str, Any] | None) -> dict[str, Any] | None:
+        """只保留最高分 Skill 的精简引用，移除可能较大的 all_hits 列表。"""
         if not ref:
             return None
         return {k: v for k, v in ref.items() if k != "all_hits"}
 
     async def _run_online_skill_evolution(self, window: dict[str, Any], *, interactive_confirm: bool = False) -> None:
+        """从已确认的对话窗口提取可复用经验，并尝试新增、合并或丢弃 Skill。
+
+        这是提示词文件层面的“进化”，不会训练模型或修改模型权重。后台写文件仍受
+        permission_mode 控制；plan 模式直接跳过。
+        """
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         messages = list(window.get("messages") or [])
         if not messages:
             return
 
+        # 使用同一模型客户端构造一个较小的辅助 LLM 查询，不占用主对话消息历史。
         side_query = self._build_side_query(max_tokens=2200)
         if side_query is None:
             return
@@ -669,6 +719,8 @@ class Agent:
         except Exception:
             return
 
+        # online_ingest 分两步：先提取至多一个候选，再与现有 Skill 比较并决定
+        # add / merge / discard；真正写入前会调用 confirm_write 检查权限。
         result = await online_ingest(
             messages=messages,
             side_query=side_query,
@@ -685,6 +737,7 @@ class Agent:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
+        """判断本轮召回的 Skill 是否相关、是否被使用，并累计使用效果统计。"""
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         hits = list(self._last_retrieved_skill_hits or [])

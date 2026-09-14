@@ -85,6 +85,7 @@ async def extract_online_skill_candidate(
     retrieved_reference: dict[str, Any] | None = None,
     hint: str = "",
 ) -> OnlineSkillCandidate | None:
+    """让辅助 LLM 从“上一轮对话 + 下一轮反馈”中提取至多一个可复用经验。"""
     system = (
         "You are Bear Code's online Skill Extractor.\n"
         "Extract at most ONE reusable skill candidate from a live conversation window.\n"
@@ -104,6 +105,7 @@ async def extract_online_skill_candidate(
         "hint": hint,
         "retrieved_reference": retrieved_reference or None,
     }
+    # side_query 使用当前配置的模型，但不把这次辅助请求写入主对话历史。
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     skills = parsed.get("skills")
     if not isinstance(skills, list) or not skills:
@@ -141,8 +143,10 @@ async def maintain_online_skill_candidate(
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
+    """比较候选与已有 Skill，决定新增、合并或丢弃，并在授权后写入磁盘。"""
     from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
 
+    # 先通过精确身份和本地相似度检索提供候选，减少重复创建同类 Skill。
     skills = discover_skills()
     exact_target = _exact_identity_match(candidate, skills)
     similar_hits = retrieve_relevant_skills(_candidate_search_text(candidate), limit=8, min_score=0.03)
@@ -180,6 +184,7 @@ async def maintain_online_skill_candidate(
         ],
     }
 
+    # 再由辅助 LLM 综合候选和已有 Skill，输出 add / merge / discard 决策。
     decision = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     action = str(decision.get("action") or "").strip().lower()
     target_skill = str(decision.get("target_skill") or "").strip()
@@ -202,6 +207,7 @@ async def maintain_online_skill_candidate(
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
     write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
+    # 后台任务只在 acceptEdits/bypassPermissions 下获准；手动提取可走交互确认。
     if confirm_write is not None and not await confirm_write(write_summary):
         return {
             "ok": False,
@@ -251,8 +257,10 @@ async def online_ingest(
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
+    """在线 Skill 进化总入口：提取候选、维护 Skill 集，并记录完整决策来源。"""
     from .skills import record_online_provenance
 
+    # 阶段 1：从对话证据中提取至多一个候选；无可靠经验时返回 action=none。
     try:
         candidate = await extract_online_skill_candidate(
             messages=messages,
@@ -281,6 +289,7 @@ async def online_ingest(
         )
         return result
 
+    # 阶段 2：决定 add / merge / discard，并在权限允许时创建或更新 SKILL.md。
     try:
         result = await maintain_online_skill_candidate(
             candidate=candidate,
